@@ -8,6 +8,13 @@ from typing import Any, Optional
 from .coloring import NoAssignment, solve_markers
 from .conflicts import analyze_pair
 from .domain import MAX_TEMPLATES, TemplateSpec
+from .plan import (
+    MAX_CAPACITY,
+    MAX_UNIQUE_RULES,
+    MIN_CAPACITY,
+    PlanError,
+    plan_migration,
+)
 from .storage import Storage
 
 
@@ -295,6 +302,143 @@ def assign_batch(storage: Storage, new_templates: list[TemplateSpec]) -> dict[st
             },
             "config": config_to_dict(new_version, active),
         }
+
+
+# ---------------------------------------------------------------------------
+# version switch planning (read-only)
+# ---------------------------------------------------------------------------
+
+
+def _resolve_version(storage: Storage, version: Any, label: str) -> tuple[int, list[TemplateSpec]]:
+    """Resolve a required configuration version number to its templates."""
+    if version is None or (isinstance(version, str) and not version.strip()):
+        raise ServiceError(
+            "MISSING_VERSION",
+            f"缺少{label}配置版号 (missing {label} version)",
+            status=422,
+            details={"reason": "missing_version", "missing": label},
+        )
+    try:
+        if isinstance(version, bool):
+            raise ValueError
+        if isinstance(version, float) and not version.is_integer():
+            raise ValueError
+        v = int(version)
+    except (TypeError, ValueError):
+        raise ServiceError(
+            "INVALID_VERSION",
+            f"{label}配置版号必须是整数: {version!r}",
+            status=422,
+            details={"reason": "invalid_version", "version": version, "side": label},
+        )
+    meta = storage.get_version_meta(v)
+    if meta is None:
+        raise ServiceError(
+            "VERSION_NOT_FOUND",
+            f"{label}配置版号 {v} 不存在",
+            status=404,
+            details={
+                "reason": "missing_version",
+                "missing_version": v,
+                "side": label,
+                "available_versions": [x["version"] for x in storage.list_versions()],
+            },
+        )
+    return v, storage.templates_at(v)
+
+
+def plan_switch(
+    storage: Storage,
+    old_version: Any,
+    new_version: Any,
+    capacity: Any,
+) -> dict[str, Any]:
+    """Build a read-only switch plan between two immutable versions.
+
+    Nothing is written: the active pointer and stored versions are untouched.
+    """
+    # Normalise the capacity early so malformed input fails consistently.
+    if capacity is None or (isinstance(capacity, str) and not capacity.strip()):
+        raise ServiceError(
+            "MISSING_CAPACITY",
+            "缺少缓存容量 capacity（1～12 条）",
+            status=422,
+            details={
+                "reason": "missing_capacity",
+                "min_capacity": MIN_CAPACITY,
+                "max_capacity": MAX_CAPACITY,
+            },
+        )
+    try:
+        cap: Optional[int]
+        if isinstance(capacity, bool):
+            raise ValueError
+        cap = int(capacity)
+        if isinstance(capacity, float) and capacity != cap:
+            raise ValueError
+    except (TypeError, ValueError):
+        raise ServiceError(
+            "INVALID_CAPACITY",
+            f"缓存容量必须是 {MIN_CAPACITY}～{MAX_CAPACITY} 的整数: {capacity!r}",
+            status=422,
+            details={"reason": "invalid_capacity", "capacity": capacity},
+        )
+    if cap < MIN_CAPACITY or cap > MAX_CAPACITY:
+        raise ServiceError(
+            "INVALID_CAPACITY",
+            f"缓存容量 {cap} 超出范围 {MIN_CAPACITY}～{MAX_CAPACITY} 条",
+            status=422,
+            details={
+                "reason": "invalid_capacity",
+                "capacity": cap,
+                "min_capacity": MIN_CAPACITY,
+                "max_capacity": MAX_CAPACITY,
+            },
+        )
+
+    with service_lock:
+        # Read-only snapshot under the same lock used by writers, so it cannot
+        # observe a half-written version.
+        old_v, old_templates = _resolve_version(storage, old_version, "旧版")
+        new_v, new_templates = _resolve_version(storage, new_version, "新版")
+        try:
+            plan = plan_migration(
+                old_templates,
+                new_templates,
+                cap,
+                old_version=old_v,
+                new_version=new_v,
+            )
+        except PlanError as exc:
+            raise ServiceError(
+                exc.code,
+                exc.message,
+                status=exc.status,
+                details=exc.details,
+            )
+
+    return {
+        "success": True,
+        "ok": True,
+        "old_version": old_v,
+        "new_version": new_v,
+        "capacity": cap,
+        "read_only": True,
+        "config_modified": False,
+        "max_unique_rules": MAX_UNIQUE_RULES,
+        **plan,
+        "summary": {
+            "old_version": old_v,
+            "new_version": new_v,
+            "capacity": cap,
+            "step_count": plan["step_count"],
+            "old_only_count": plan["old_only_count"],
+            "new_only_count": plan["new_only_count"],
+            "shared_rule_count": plan["shared_rule_count"],
+            "unique_rule_total": plan["unique_rule_total"],
+            "max_unique_rules": MAX_UNIQUE_RULES,
+        },
+    }
 
 
 # ---------------------------------------------------------------------------

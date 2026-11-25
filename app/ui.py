@@ -69,6 +69,18 @@ HTML = r"""<!doctype html>
       <p><button onclick="assign()">提交配码</button></p>
       <pre id="assignOut"></pre>
     </section>
+
+    <section class="card">
+      <h2>换版计划（只读）/api/plan</h2>
+      <div class="row">
+        <input id="planOld" placeholder="旧版号" style="max-width:110px"/>
+        <input id="planNew" placeholder="新版号" style="max-width:110px"/>
+        <input id="planCap" placeholder="缓存容量 1-12" style="max-width:150px" value="4"/>
+        <button onclick="planSwitch()">生成清单</button>
+      </div>
+      <p class="muted">只读取两个版本，不产生新版本、不改动当前配置。</p>
+      <pre id="planOut">（结果）</pre>
+    </section>
   </div>
 
 <script>
@@ -131,6 +143,14 @@ async function assign(){
   const body = document.getElementById('assignBody').value;
   const r = await send('POST','/api/assign', body);
   show('assignOut', r); loadConfig();
+}
+async function planSwitch(){
+  const oldVersion = document.getElementById('planOld').value.trim();
+  const newVersion = document.getElementById('planNew').value.trim();
+  const capacity = document.getElementById('planCap').value.trim();
+  const r = await send('POST','/api/plan',
+    {old_version: oldVersion, new_version: newVersion, capacity: capacity});
+  show('planOut', r);
 }
 async function resetAll(){
   if(!confirm('确定清空当前配置？')) return;

@@ -7,7 +7,7 @@ still accept a wide range of legacy / alias payloads.
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -152,6 +152,56 @@ def find_code(data: dict) -> Any:
     if marker is not None and body is not None:
         return f"{marker}{body}"
     return None
+
+
+class PlanRequest(BaseModel):
+    """Read-only version switch (换版) plan request.
+
+    Accepted from either a clean canonical body or the many alias spellings
+    (``from_version``/``to_version``, ``cache_size``, Chinese keys, ...).
+    """
+
+    model_config = ConfigDict(
+        extra="ignore",
+        json_schema_extra={
+            "example": {"old_version": 1, "new_version": 2, "capacity": 4}
+        },
+    )
+
+    old_version: Optional[Union[int, str, float]] = Field(
+        None, description="旧（现用）配置版号", examples=[1]
+    )
+    new_version: Optional[Union[int, str, float]] = Field(
+        None, description="新（目标）配置版号", examples=[2]
+    )
+    capacity: Optional[Union[int, str, float]] = Field(
+        None,
+        description="缓存可同时容纳的规则条数，整数 1～12",
+        examples=[4],
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce(cls, data: Any) -> Any:
+        if isinstance(data, PlanRequest):
+            return {
+                "old_version": data.old_version,
+                "new_version": data.new_version,
+                "capacity": data.capacity,
+            }
+        if not isinstance(data, dict):
+            raise ValueError("换版计划请求体必须是 JSON 对象")
+        old_v, new_v, cap = P.extract_plan_request(data)
+        for value in (old_v, new_v, cap):
+            # JSON booleans are never valid version numbers or capacities;
+            # reject them before Pydantic coerces True -> 1.
+            if isinstance(value, bool):
+                raise ValueError("配置版号与缓存容量必须是整数，不能是布尔值")
+        return {"old_version": old_v, "new_version": new_v, "capacity": cap}
+
+
+def find_plan_versions(data: dict) -> tuple[Any, Any, Any]:
+    return P.extract_plan_request(data)
 
 
 class DecodeRequest(BaseModel):

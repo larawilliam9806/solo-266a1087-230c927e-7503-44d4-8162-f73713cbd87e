@@ -14,7 +14,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 from . import payload as P
 from .domain import DomainError
-from .schemas import BatchRequest, DecodeRequest, find_code
+from .schemas import BatchRequest, DecodeRequest, PlanRequest, find_code, find_plan_versions
 from .ui import HTML as UI_HTML
 from .service import (
     ServiceError,
@@ -24,6 +24,7 @@ from .service import (
     encode_code,
     import_templates,
     pair_warnings,
+    plan_switch,
 )
 from .storage import Storage
 
@@ -38,6 +39,7 @@ app = FastAPI(
         "- 导入现用模板及标记: `POST /api/import`\n"
         "- 批量登记并配码: `POST /api/assign`（或 `POST /api/templates`）\n"
         "- 解码: `POST /api/decode`\n"
+        "- 换版计划（只读）: `POST /api/plan`\n"
         "- 当前生效配置: `GET /api/config`"
     ),
     version="1.0.0",
@@ -189,6 +191,7 @@ def root() -> dict:
             "create_templates": "POST /api/templates",
             "decode": "POST /api/decode | GET /api/decode/{code}",
             "encode": "POST /api/encode",
+            "plan": "POST /api/plan",
             "config": "GET /api/config",
             "templates": "GET /api/templates",
             "conflicts": "GET /api/conflicts",
@@ -322,6 +325,17 @@ async def reset_handler() -> JSONResponse:
             "config": config_to_dict(version, []),
         },
     )
+
+
+async def plan_handler(payload: PlanRequest) -> JSONResponse:
+    """Read-only switch plan; never mutates configuration."""
+    result = plan_switch(
+        storage,
+        payload.old_version,
+        payload.new_version,
+        payload.capacity,
+    )
+    return JSONResponse(status_code=200, content=result)
 
 
 async def decode_handler(payload: DecodeRequest) -> JSONResponse:
@@ -475,6 +489,23 @@ _DECODE_PATHS = [
     "/jiema",
 ]
 _ENCODE_PATHS = ["/api/encode", "/api/build-code", "/encode"]
+_PLAN_PATHS = [
+    "/api/plan",
+    "/api/switch-plan",
+    "/api/switch_plan",
+    "/api/version-plan",
+    "/api/version_plan",
+    "/api/versions/plan",
+    "/api/config/plan",
+    "/api/plans",
+    "/api/upgrade-plan",
+    "/api/migration-plan",
+    "/api/huanban",
+    "/api/huanban/plan",
+    "/api/换版计划",
+    "/plan",
+    "/switch-plan",
+]
 _RESET_PATHS = ["/api/admin/reset", "/api/reset", "/reset"]
 
 for _p in _IMPORT_PATHS:
@@ -497,6 +528,11 @@ for _p in _DECODE_PATHS:
     app.add_api_route(_p + "/", decode_handler, methods=["POST"], include_in_schema=False)
 for _p in _ENCODE_PATHS:
     app.add_api_route(_p, encode_handler, methods=["POST"], include_in_schema=False)
+for _p in _PLAN_PATHS:
+    app.add_api_route(
+        _p, plan_handler, methods=["POST"], include_in_schema=(_p == "/api/plan")
+    )
+    app.add_api_route(_p + "/", plan_handler, methods=["POST"], include_in_schema=False)
 for _p in _RESET_PATHS:
     app.add_api_route(_p, reset_handler, methods=["POST"], include_in_schema=False)
 
@@ -529,6 +565,13 @@ app.add_api_route(
     summary="按模板生成磅单码（辅助）",
     tags=["encode"],
 )
+app.add_api_route(
+    "/api/v1/plan",
+    plan_handler,
+    methods=["POST"],
+    summary="计算两版配置之间的换版（缓存规则换装）计划（只读）",
+    tags=["plan"],
+)
 
 # GET decode convenience forms.
 app.add_api_route(
@@ -554,6 +597,7 @@ def decode_query(code: str) -> JSONResponse:
 
 _DECODE_TOKENS = ("decode", "jiema", "parse", "unpack", "analysis", "readcode")
 _IMPORT_TOKENS = ("import", "daoru", "load-current", "loadcurrent")
+_PLAN_TOKENS = ("plan", "huanban", "switch", "swap", "migration", "upgrade", "换版")
 _ASSIGN_TOKENS = (
     "assign", "peima", "register", "batch", "dengji", "allocate",
     "match", "create", "add", "marker", "template",
@@ -562,6 +606,8 @@ _ASSIGN_TOKENS = (
 
 def _classify_path(path: str) -> str:
     p = P.norm_key(path.replace("/", "_"))
+    if any(t in p for t in _PLAN_TOKENS):
+        return "plan"
     if any(t in p for t in _IMPORT_TOKENS):
         return "import"
     if any(t in p for t in _DECODE_TOKENS):
@@ -569,6 +615,27 @@ def _classify_path(path: str) -> str:
     if any(t in p for t in _ASSIGN_TOKENS):
         return "assign"
     return "unknown"
+
+
+def _plan_from_raw(raw: Any, request: Request) -> JSONResponse:
+    if isinstance(raw, dict):
+        old_v, new_v, cap = find_plan_versions(raw)
+    else:
+        old_v = new_v = cap = None
+    if old_v is None:
+        old_v = request.query_params.get("old_version") or request.query_params.get(
+            "old"
+        )
+    if new_v is None:
+        new_v = request.query_params.get("new_version") or request.query_params.get(
+            "new"
+        )
+    if cap is None:
+        cap = request.query_params.get("capacity") or request.query_params.get(
+            "cache_size"
+        )
+    result = plan_switch(storage, old_v, new_v, cap)
+    return JSONResponse(status_code=200, content=result)
 
 
 async def _catch_all_post(request: Request, rest: str = "") -> JSONResponse:
@@ -605,6 +672,9 @@ async def _catch_all_post(request: Request, rest: str = "") -> JSONResponse:
             code = str(code).zfill(9)
         return JSONResponse(status_code=200, content=decode_code(storage, code))
 
+    if kind == "plan":
+        return _plan_from_raw(raw, request)
+
     # assign / import both parse a BatchRequest
     try:
         req = BatchRequest.model_validate(raw if raw not in (None, {}) else {})
@@ -633,6 +703,8 @@ def _catch_all_get(request: Request, rest: str = "") -> JSONResponse:
                 code = tail
         if code:
             return JSONResponse(status_code=200, content=decode_code(storage, code))
+    if kind == "plan":
+        return _plan_from_raw({}, request)
     raise ServiceError("NOT_FOUND", f"路径不存在: {request.url.path}", status=404)
 
 

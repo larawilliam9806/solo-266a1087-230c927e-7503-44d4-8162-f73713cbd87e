@@ -519,3 +519,233 @@ def test_batch_clique_uses_three_fresh_digits(client):
     assert len(set(j["markers"])) == 3
     assert "1" not in j["markers"]
     assert j["new_digit_count"] == 3
+
+
+# ---------------------------------------------------------------------------
+# read-only version switch (换版) plan
+# ---------------------------------------------------------------------------
+
+PLAN_BASE = [
+    {
+        "name": "甲厂",
+        "marker": "1",
+        "prefix": "10",
+        "scale": {"start": 2, "length": 2},
+        "weight": {"start": 4, "length": 4},
+    },
+    {
+        "name": "乙厂",
+        "marker": "2",
+        "prefix": "20",
+        "scale": {"start": 2, "length": 3},
+        "weight": {"start": 5, "length": 3},
+    },
+]
+
+
+def make_two_versions(client):
+    """Import an old version and a derived new version; return both numbers."""
+    r = client.post("/api/import", json={"templates": PLAN_BASE})
+    assert r.status_code == 200, r.text
+    old_version = client.get("/api/config").json()["version"]
+
+    changed = [dict(t) for t in PLAN_BASE]
+    changed[1] = {
+        "name": "乙厂新",
+        "marker": "2",
+        "prefix": "21",
+        "scale": {"start": 2, "length": 3},
+        "weight": {"start": 5, "length": 3},
+    }
+    r = client.post("/api/import", json={"templates": changed})
+    assert r.status_code == 200, r.text
+    new_version = client.get("/api/config").json()["version"]
+    return old_version, new_version
+
+
+def test_plan_returns_ordered_checklist(client):
+    old_v, new_v = make_two_versions(client)
+    r = client.post(
+        "/api/plan",
+        json={"old_version": old_v, "new_version": new_v, "capacity": 2},
+    )
+    assert r.status_code == 200, r.text
+    j = r.json()
+    assert j["success"] is True
+    assert j["old_version"] == old_v and j["new_version"] == new_v
+    assert j["capacity"] == 2
+    assert j["step_count"] == len(j["steps"]) == 1
+    step = j["steps"][0]
+    assert step["action"] == "replace"
+    assert step["remove"]["name"] == "乙厂"
+    assert step["install"]["name"] == "乙厂新"
+    assert step["size_after"] <= 2
+    assert j["shared_rule_count"] == 1
+    assert j["old_only_count"] == 1 and j["new_only_count"] == 1
+    # ordered
+    assert [s["order"] for s in j["steps"]] == list(
+        range(1, len(j["steps"]) + 1)
+    )
+
+
+def test_plan_is_read_only(client):
+    old_v, new_v = make_two_versions(client)
+    before = client.get("/api/config").json()
+    versions_before = client.get("/api/versions").json()["versions"]
+
+    r = client.post(
+        "/api/plan",
+        json={"old_version": old_v, "new_version": new_v, "capacity": 3},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["read_only"] is True
+    assert r.json()["config_modified"] is False
+
+    after = client.get("/api/config").json()
+    assert after["version"] == before["version"]
+    assert after["templates"] == before["templates"]
+    assert (
+        client.get("/api/versions").json()["versions"] == versions_before
+    ), "planning must not create a version"
+
+
+def test_plan_aliases_and_lenient_fields(client):
+    old_v, new_v = make_two_versions(client)
+    bodies = [
+        {"from_version": old_v, "to_version": new_v, "cache_size": 2},
+        {"旧版": old_v, "新版": new_v, "缓存容量": 2},
+        {"versions": {"old": old_v, "new": new_v}, "capacity": 2},
+    ]
+    for path in ["/api/plan", "/api/switch-plan", "/api/version-plan", "/plan"]:
+        for body in bodies:
+            r = client.post(path, json=body)
+            assert r.status_code == 200, (path, body, r.text)
+            assert r.json()["step_count"] == 1
+    r = client.get("/api/plan", params={"old": old_v, "new": new_v, "capacity": 2})
+    assert r.status_code == 200
+    assert r.json()["step_count"] == 1
+
+
+def test_plan_missing_version(client):
+    old_v, new_v = make_two_versions(client)
+    r = client.post("/api/plan", json={"old_version": old_v, "capacity": 2})
+    assert r.status_code == 422
+    assert r.json()["code"] == "MISSING_VERSION"
+    assert r.json()["details"]["reason"] == "missing_version"
+
+
+def test_plan_unknown_version(client):
+    old_v, _ = make_two_versions(client)
+    r = client.post(
+        "/api/plan", json={"old_version": old_v, "new_version": 999, "capacity": 2}
+    )
+    assert r.status_code == 404
+    assert r.json()["code"] == "VERSION_NOT_FOUND"
+
+
+def test_plan_invalid_capacity(client):
+    old_v, new_v = make_two_versions(client)
+    for capacity in (0, 13, -5, "x"):
+        r = client.post(
+            "/api/plan",
+            json={"old_version": old_v, "new_version": new_v, "capacity": capacity},
+        )
+        assert r.status_code == 422, (capacity, r.text)
+        assert r.json()["code"] == "INVALID_CAPACITY"
+    r = client.post(
+        "/api/plan", json={"old_version": old_v, "new_version": new_v}
+    )
+    assert r.status_code == 422
+    assert r.json()["code"] == "MISSING_CAPACITY"
+
+
+def test_plan_unique_rule_limit(client):
+    old_set = [
+        {
+            "name": f"f{i}",
+            "marker": str(i),
+            "prefix": str(i),
+            "scale": {"start": 2, "length": 2},
+            "weight": {"start": 4, "length": 4},
+        }
+        for i in range(5)
+    ]
+    r = client.post("/api/import", json={"templates": old_set})
+    assert r.status_code == 200, r.text
+    old_v = r.json()["version"]
+
+    new_set = [
+        {
+            "name": f"g{i}",
+            "marker": str(5 + i),
+            "prefix": str(5 + i),
+            "scale": {"start": 2, "length": 2},
+            "weight": {"start": 4, "length": 4},
+        }
+        for i in range(4)
+    ]
+    r = client.post("/api/import", json={"templates": new_set})
+    assert r.status_code == 200, r.text
+    new_v = r.json()["version"]
+
+    r = client.post(
+        "/api/plan",
+        json={"old_version": old_v, "new_version": new_v, "capacity": 12},
+    )
+    assert r.status_code == 409
+    assert r.json()["code"] == "RULE_LIMIT_EXCEEDED"
+    assert r.json()["details"]["unique_rule_total"] == 9
+
+
+def test_plan_decode_conflict_in_a_version(client):
+    r = client.post(
+        "/api/import",
+        json={
+            "templates": [
+                {"name": "a", "marker": "1", "prefix": "10",
+                 "scale": {"start": 2, "length": 2},
+                 "weight": {"start": 4, "length": 4}},
+                {"name": "b", "marker": "1", "prefix": "10",
+                 "scale": {"start": 2, "length": 3},
+                 "weight": {"start": 4, "length": 4}},
+            ]
+        },
+    )
+    assert r.status_code == 200
+    bad_v = r.json()["version"]
+    r = client.post("/api/import", json={"templates": [PLAN_BASE[0]]})
+    good_v = r.json()["version"]
+
+    for old_v, new_v in ((bad_v, good_v), (good_v, bad_v)):
+        r = client.post(
+            "/api/plan",
+            json={"old_version": old_v, "new_version": new_v, "capacity": 4},
+        )
+        assert r.status_code == 409, r.text
+        assert r.json()["code"] == "DECODE_CONFLICT"
+
+
+def test_plan_capacity_too_small(client):
+    r = client.post(
+        "/api/assign",
+        json={
+            "templates": [
+                {"name": "a", "prefix": "10",
+                 "scale": {"start": 2, "length": 2},
+                 "weight": {"start": 4, "length": 4}},
+                {"name": "b", "prefix": "20",
+                 "scale": {"start": 2, "length": 3},
+                 "weight": {"start": 5, "length": 3}},
+            ]
+        },
+    )
+    v2 = r.json()["version"]
+    old_v = client.post("/api/admin/reset").json()["version"]
+    # old version empty, new version has two rules, capacity 1
+    r = client.post(
+        "/api/plan",
+        json={"old_version": old_v, "new_version": v2, "capacity": 1},
+    )
+    assert r.status_code == 409
+    assert r.json()["code"] == "NO_FEASIBLE_ORDER"
+    assert r.json()["details"]["reason"] == "capacity_too_small"

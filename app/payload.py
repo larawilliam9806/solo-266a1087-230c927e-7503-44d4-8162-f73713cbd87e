@@ -536,3 +536,83 @@ def loads_lenient(body: bytes) -> Any:
     except json.JSONDecodeError:
         # Maybe form-encoded-ish? Let caller handle; re-raise a clear error.
         raise
+
+
+# ---------------------------------------------------------------------------
+# switch-plan fields
+# ---------------------------------------------------------------------------
+
+_OLD_VERSION_KEYS = (
+    "oldversion",
+    "oldver",
+    "old",
+    "fromversion",
+    "fromver",
+    "from",
+    "baseversion",
+    "sourceversion",
+    "source",
+    "currentversion",
+    "current",
+    "旧版",
+    "旧版本",
+    "旧版号",
+    "原版",
+    "原版本",
+    "旧配置",
+)
+_NEW_VERSION_KEYS = (
+    "newversion",
+    "newver",
+    "new",
+    "toversion",
+    "tover",
+    "to",
+    "targetversion",
+    "target",
+    "destversion",
+    "destination",
+    "新版",
+    "新版本",
+    "新版号",
+    "新配置",
+)
+_CAPACITY_KEYS = (
+    "capacity",
+    "cachecapacity",
+    "cachesize",
+    "cachelimit",
+    "capacitylimit",
+    "cap",
+    "limit",
+    "size",
+    "容量",
+    "缓存容量",
+    "缓存大小",
+    "缓存条数",
+)
+
+
+def extract_plan_request(payload: Any) -> tuple[Any, Any, Any]:
+    """Return ``(old_version, new_version, capacity)`` from a lenient body."""
+    if not isinstance(payload, dict):
+        return None, None, None
+    d = normalized_dict(payload)
+    old_v, _ = pick(d, *_OLD_VERSION_KEYS)
+    new_v, _ = pick(d, *_NEW_VERSION_KEYS)
+    cap, _ = pick(d, *_CAPACITY_KEYS)
+    # Nested envelope: {"versions": {"old": .., "new": ..}, "capacity": ..}
+    if old_v is None or new_v is None:
+        nested_v, _ = pick(d, "versions", "configversions", "versionpair")
+        if isinstance(nested_v, dict):
+            nd = normalized_dict(nested_v)
+            if old_v is None:
+                old_v, _ = pick(nd, *_OLD_VERSION_KEYS)
+            if new_v is None:
+                new_v, _ = pick(nd, *_NEW_VERSION_KEYS)
+    if cap is None:
+        cache_v, _ = pick(d, "cache", "cachesettings")
+        if isinstance(cache_v, dict):
+            cd = normalized_dict(cache_v)
+            cap, _ = pick(cd, *_CAPACITY_KEYS)
+    return old_v, new_v, cap
